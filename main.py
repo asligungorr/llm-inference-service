@@ -24,10 +24,22 @@ client = OpenAI(
 
 app = FastAPI(title = "LLM Inference ML Service")
 
+def clean_output(text: str) -> str:
+    text = text.replace("<think>", "").replace("</think>", "")
+    return text.strip()
+
+
+def limit_sentences(text: str, n: int) -> str:
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return " ".join(sentences[:n])
+
+
 
 #request model
 class GenerateRequest(BaseModel):
     prompt:  str
+    sentences: int=3
 
 @app.get("/health")
 def health_check():
@@ -36,16 +48,26 @@ def health_check():
 @app.post("/generate")
 def generate(req: GenerateRequest):
     try:
+        system_prompt= (
+            f"Answer in exactly {req.sentences} sentences. "
+            "Do not include reasoning or explanations. "
+        )
         completion = client.chat.completions.create(
             model=HF_MODEL_ID,
             messages=[
+                {"role": "system","content": system_prompt},
                 {"role":"user","content": req.prompt}
                       ],
-            temperature=0.7,
+            temperature=0.4,
             max_tokens=100
         )
+
+        raw_output= completion.choices[0].message.content
+        cleaned= clean_output(raw_output)
+        final= limit_sentences(cleaned, req.sentences)
         return{
-            "output": completion.choices[0].message.content
+            "sentences": req.sentences,
+            "output": final
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail= str(e))
