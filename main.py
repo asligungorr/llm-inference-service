@@ -5,8 +5,7 @@ import os
 import requests
 from openai import OpenAI
 import re
-import time
-from collections import defaultdict
+import redis
 
 load_dotenv()
 
@@ -24,7 +23,9 @@ MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", 600))
 RATE_LIMIT_WINDOW= 60 #seconds
 MAX_REQUESTS_PER_WINDOW= 5
 
-rate_limit_store= defaultdict(list)
+REDIS_HOST= os.getenv("REDIS_HOST","redis")
+REDIS_PORT= int(os.getenv("REDIS_PORT",6379))
+
 
 
 client = OpenAI(
@@ -32,21 +33,27 @@ client = OpenAI(
     api_key=HF_TOKEN
 )
 
+redis_client= redis.Redis(
+    host= REDIS_HOST,
+    port= REDIS_PORT,
+    decode_responses= True
+)
+
 def check_rate_limit(client_id: str):
-    now= time.time()
+    key= f"rate_limit: {client_id}"
+    
+    current= redis_client.incr(key)
 
-    timestamps= rate_limit_store[client_id]
-
-    rate_limit_store[client_id] = [
-        ts for ts in timestamps if now - ts < RATE_LIMIT_WINDOW
-    ]
-
-    if len(rate_limit_store[client_id]) >= MAX_REQUESTS_PER_WINDOW:
+    if current == 1:
+        redis_client.expire(key, RATE_LIMIT_WINDOW)
+    
+    if current > MAX_REQUESTS_PER_WINDOW:
         raise HTTPException(
             status_code= 429,
             detail= "Rate limit exceeded. Try again later."
         )
-    rate_limit_store[client_id].append(now)
+
+
 
 app = FastAPI(title = "LLM Inference ML Service")
 
@@ -88,6 +95,18 @@ def check_inference_budget(prompt:str, sentence_count: int):
             detail= "Total inference budget exceeded"
         )
     
+def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
+        
+    if not client_id:
+        raise HTTPException(
+            status_code= 400,
+            detail= "X-Client-Id header is required."
+            )
+        
+    check_rate_limit(client_id)
+    check_inference_budget(prompt, sentence_count)
+        
+    
 
 #request model
 class GenerateRequest(BaseModel):
@@ -100,14 +119,15 @@ def health_check():
 
 @app.post("/generate")
 def generate(req: GenerateRequest, x_client_id: str = Header(None)):
-    if not x_client_id:
-        raise HTTPException(
-            status_code=400,
-            detail= "X-Client-Id header is required"
-        )
+
     try:
-        check_inference_budget(req.prompt, req.sentences)
-        check_rate_limit(x_client_id)
+
+        enforce_policies(
+            client_id= x_client_id,
+            prompt= req.prompt,
+            sentence_count= req.sentences
+        )
+
 
         system_prompt= (
             f"Answer in exactly {req.sentences} sentences. "
