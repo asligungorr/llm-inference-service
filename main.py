@@ -6,6 +6,8 @@ import requests
 from openai import OpenAI
 import re
 import redis
+import hashlib
+import json
 
 load_dotenv()
 
@@ -26,7 +28,7 @@ MAX_REQUESTS_PER_WINDOW= 5
 REDIS_HOST= os.getenv("REDIS_HOST","redis")
 REDIS_PORT= int(os.getenv("REDIS_PORT",6379))
 
-
+DEDUP_TTL_SECONDS= int(os.getenv("DEDUP_TTL_SECONDS", 120))
 
 client = OpenAI(
     base_url=HF_API_BASE_URL,
@@ -53,9 +55,6 @@ def check_rate_limit(client_id: str):
             detail= "Rate limit exceeded. Try again later."
         )
 
-
-
-app = FastAPI(title = "LLM Inference ML Service")
 
 def clean_output(text: str) -> str:
     text = text.replace("<think>", "").replace("</think>", "")
@@ -94,6 +93,17 @@ def check_inference_budget(prompt:str, sentence_count: int):
             status_code= 400,
             detail= "Total inference budget exceeded"
         )
+
+def make_request_fingerprints(*, prompt: str, sentences: int, model_id: str) -> str:
+    payload= {
+        "prompt" : prompt,
+        "sentences" : sentences,
+        "model_id": model_id
+    }
+
+    raw= json.dumps(payload, sort_keys=True)# keys are sorted alphabetically
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     
 def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
         
@@ -106,7 +116,7 @@ def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
     check_rate_limit(client_id)
     check_inference_budget(prompt, sentence_count)
         
-    
+app = FastAPI(title = "LLM Inference ML Service")   
 
 #request model
 class GenerateRequest(BaseModel):
@@ -128,7 +138,21 @@ def generate(req: GenerateRequest, x_client_id: str = Header(None)):
             sentence_count= req.sentences
         )
 
+        fingerprint= make_request_fingerprints(
+            prompt= req.prompt,
+            sentences= req.sentences,
+            model_id= HF_MODEL_ID
+        )
 
+        cache_key= f"dedup:{fingerprint}"
+        cached= redis_client.get(cache_key)
+        
+        if cached:
+            return{
+                "sentences": req.sentences,
+                "output": cached,
+                "cache": "hit"
+            }
         system_prompt= (
             f"Answer in exactly {req.sentences} sentences. "
             "Do not include reasoning or explanations. "
@@ -147,9 +171,16 @@ def generate(req: GenerateRequest, x_client_id: str = Header(None)):
         cleaned= clean_output(raw_output)
         final= limit_sentences(cleaned, req.sentences)
 
+        redis_client.setex(
+            cache_key,
+            DEDUP_TTL_SECONDS,
+            final
+        )
+
         return{
             "sentences": req.sentences,
-            "output": final
+            "output": final,
+            "cache": "miss"
         }
     except HTTPException:
 
