@@ -8,6 +8,8 @@ import re
 import redis
 import hashlib
 import json
+import uuid
+import threading 
 
 load_dotenv()
 
@@ -104,7 +106,38 @@ def make_request_fingerprints(*, prompt: str, sentences: int, model_id: str) -> 
     raw= json.dumps(payload, sort_keys=True)# keys are sorted alphabetically
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    
+
+def run_async_inference(job_id: str, prompt: str, sentences: int):
+    try:
+        redis_client.set(f"job:{job_id}:status", "running")
+
+        system_prompt = (
+            f"Answer in exactly {sentences} sentences. "
+            "Do not include reasoning or explanations. "
+        )
+        
+        completion = client.chat.completions.create(
+            model= HF_MODEL_ID,
+            messages= [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature= 0.4,
+            max_tokens= 100
+        )
+
+        raw_output = completion.choices[0].message.content
+        cleaned = clean_output(raw_output)
+        final = limit_sentences(cleaned, sentences)
+
+        redis_client.set(f"job:{job_id}:result", final)
+        redis_client.set(f"job:{job_id}:status", "completed")
+
+    except Exception as e:
+        redis_client.set(f"job:{job_id}:status", "failed")
+        redis_client.set(f"job:{job_id}:error", str(e))
+
+
 def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
         
     if not client_id:
@@ -191,3 +224,74 @@ def generate(req: GenerateRequest, x_client_id: str = Header(None)):
             status_code=500,
             detail=f"Internal server error:{str(e)}"
             )
+    
+@app.post("/generate/async")
+def generate_async(req: GenerateRequest, x_client_id: str = Header(None)):
+
+    enforce_policies(
+        client_id= x_client_id,
+        prompt= req.prompt,
+        sentence_count= req.sentences
+    )
+
+    job_id = str(uuid.uuid4())
+
+    redis_client.set(
+        f"job:{job_id}:status",
+        "pending"
+    )
+
+    thread = threading.Thread(
+        target = run_async_inference,
+        args = (job_id, req.prompt, req.sentences),
+        daemon = True
+
+    )
+
+    thread.start()
+
+    return{
+        "job_id": job_id,
+        "status": "pending"
+    }
+
+@app.get("/result/{job_id}")
+def get_result(job_id: str):
+    
+    status = redis_client.get(f"job:{job_id}:status")
+
+    if not status:
+        raise HTTPException(
+            status_code= 404,
+            detail= "job not found"
+        )
+    
+    if status == "completed":
+        result = redis_client.get(f"job:{job_id}:result")
+
+        return{
+            "job_id": job_id,
+            "status": status,
+            "output": result
+        }
+    
+    if status == "failed":
+        error = redis_client.get(f"job:{job_id}:error")
+        
+        return{
+            "job_id": job_id,
+            "status": status,
+            "error": error
+        }
+    
+    return{
+        "job_id": job_id,
+        "status": status
+    }
+    
+
+
+
+
+
+    
