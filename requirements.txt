@@ -4,5 +4,8 @@ python-dotenv
 openai
 requests
 pytest
+pytest-asyncio
 httpx
 redis
+celery
+

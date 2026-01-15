@@ -3,13 +3,14 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import requests
-from openai import OpenAI
 import re
-import redis
 import hashlib
 import json
 import uuid
-import threading 
+from tasks import run_async_inference
+from services import redis_client, client, clean_output, limit_sentences, HF_MODEL_ID
+
+
 
 load_dotenv()
 
@@ -32,16 +33,6 @@ REDIS_PORT= int(os.getenv("REDIS_PORT",6379))
 
 DEDUP_TTL_SECONDS= int(os.getenv("DEDUP_TTL_SECONDS", 120))
 
-client = OpenAI(
-    base_url=HF_API_BASE_URL,
-    api_key=HF_TOKEN
-)
-
-redis_client= redis.Redis(
-    host= REDIS_HOST,
-    port= REDIS_PORT,
-    decode_responses= True
-)
 
 def check_rate_limit(client_id: str):
     key= f"rate_limit: {client_id}"
@@ -57,16 +48,6 @@ def check_rate_limit(client_id: str):
             detail= "Rate limit exceeded. Try again later."
         )
 
-
-def clean_output(text: str) -> str:
-    text = text.replace("<think>", "").replace("</think>", "")
-    return text.strip()
-
-
-def limit_sentences(text: str, n: int) -> str:
-    import re
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return " ".join(sentences[:n])
 
 #before calling the llm model, the backend must decide that is this request expensive or exceeding the limits?
 def estimate_input_tokens(prompt:str) -> int:
@@ -106,36 +87,6 @@ def make_request_fingerprints(*, prompt: str, sentences: int, model_id: str) -> 
     raw= json.dumps(payload, sort_keys=True)# keys are sorted alphabetically
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-
-def run_async_inference(job_id: str, prompt: str, sentences: int):
-    try:
-        redis_client.set(f"job:{job_id}:status", "running")
-
-        system_prompt = (
-            f"Answer in exactly {sentences} sentences. "
-            "Do not include reasoning or explanations. "
-        )
-        
-        completion = client.chat.completions.create(
-            model= HF_MODEL_ID,
-            messages= [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            temperature= 0.4,
-            max_tokens= 100
-        )
-
-        raw_output = completion.choices[0].message.content
-        cleaned = clean_output(raw_output)
-        final = limit_sentences(cleaned, sentences)
-
-        redis_client.set(f"job:{job_id}:result", final)
-        redis_client.set(f"job:{job_id}:status", "completed")
-
-    except Exception as e:
-        redis_client.set(f"job:{job_id}:status", "failed")
-        redis_client.set(f"job:{job_id}:error", str(e))
 
 
 def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
@@ -241,14 +192,7 @@ def generate_async(req: GenerateRequest, x_client_id: str = Header(None)):
         "pending"
     )
 
-    thread = threading.Thread(
-        target = run_async_inference,
-        args = (job_id, req.prompt, req.sentences),
-        daemon = True
-
-    )
-
-    thread.start()
+    run_async_inference.delay(job_id, req.prompt, req.sentences)
 
     return{
         "job_id": job_id,
