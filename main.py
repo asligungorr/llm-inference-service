@@ -3,11 +3,14 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import requests
-from openai import OpenAI
 import re
-import redis
 import hashlib
 import json
+import uuid
+from tasks import run_async_inference
+from services import redis_client, client, clean_output, limit_sentences, HF_MODEL_ID
+
+
 
 load_dotenv()
 
@@ -30,16 +33,6 @@ REDIS_PORT= int(os.getenv("REDIS_PORT",6379))
 
 DEDUP_TTL_SECONDS= int(os.getenv("DEDUP_TTL_SECONDS", 120))
 
-client = OpenAI(
-    base_url=HF_API_BASE_URL,
-    api_key=HF_TOKEN
-)
-
-redis_client= redis.Redis(
-    host= REDIS_HOST,
-    port= REDIS_PORT,
-    decode_responses= True
-)
 
 def check_rate_limit(client_id: str):
     key= f"rate_limit: {client_id}"
@@ -55,16 +48,6 @@ def check_rate_limit(client_id: str):
             detail= "Rate limit exceeded. Try again later."
         )
 
-
-def clean_output(text: str) -> str:
-    text = text.replace("<think>", "").replace("</think>", "")
-    return text.strip()
-
-
-def limit_sentences(text: str, n: int) -> str:
-    import re
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return " ".join(sentences[:n])
 
 #before calling the llm model, the backend must decide that is this request expensive or exceeding the limits?
 def estimate_input_tokens(prompt:str) -> int:
@@ -104,7 +87,8 @@ def make_request_fingerprints(*, prompt: str, sentences: int, model_id: str) -> 
     raw= json.dumps(payload, sort_keys=True)# keys are sorted alphabetically
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    
+
+
 def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
         
     if not client_id:
@@ -191,3 +175,67 @@ def generate(req: GenerateRequest, x_client_id: str = Header(None)):
             status_code=500,
             detail=f"Internal server error:{str(e)}"
             )
+    
+@app.post("/generate/async")
+def generate_async(req: GenerateRequest, x_client_id: str = Header(None)):
+
+    enforce_policies(
+        client_id= x_client_id,
+        prompt= req.prompt,
+        sentence_count= req.sentences
+    )
+
+    job_id = str(uuid.uuid4())
+
+    redis_client.set(
+        f"job:{job_id}:status",
+        "pending"
+    )
+
+    run_async_inference.delay(job_id, req.prompt, req.sentences)
+
+    return{
+        "job_id": job_id,
+        "status": "pending"
+    }
+
+@app.get("/result/{job_id}")
+def get_result(job_id: str):
+    
+    status = redis_client.get(f"job:{job_id}:status")
+
+    if not status:
+        raise HTTPException(
+            status_code= 404,
+            detail= "job not found"
+        )
+    
+    if status == "completed":
+        result = redis_client.get(f"job:{job_id}:result")
+
+        return{
+            "job_id": job_id,
+            "status": status,
+            "output": result
+        }
+    
+    if status == "failed":
+        error = redis_client.get(f"job:{job_id}:error")
+        
+        return{
+            "job_id": job_id,
+            "status": status,
+            "error": error
+        }
+    
+    return{
+        "job_id": job_id,
+        "status": status
+    }
+    
+
+
+
+
+
+    

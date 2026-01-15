@@ -16,3 +16,13 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
+
+  worker:
+    build: .
+    container_name: llm-worker
+    command: celery -A celery_app.celery_app worker --loglevel=info
+    env_file:
+      - .env
+    depends_on:
+      - redis
+
