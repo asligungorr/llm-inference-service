@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
@@ -8,7 +8,10 @@ import hashlib
 import json
 import uuid
 from tasks import run_async_inference
+import logging
 from services import redis_client, client, clean_output, limit_sentences, HF_MODEL_ID
+from prometheus_client import Counter, Histogram, generate_latest
+
 
 
 
@@ -32,6 +35,12 @@ REDIS_HOST= os.getenv("REDIS_HOST","redis")
 REDIS_PORT= int(os.getenv("REDIS_PORT",6379))
 
 DEDUP_TTL_SECONDS= int(os.getenv("DEDUP_TTL_SECONDS", 120))
+
+REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["path", "method", "status"] )
+LATENCY = Histogram("http_request_duration_seconds", "Request latency", ["path"])
+
+
+
 
 
 def check_rate_limit(client_id: str):
@@ -102,6 +111,28 @@ def enforce_policies(*, client_id: str, prompt: str, sentence_count: int):
         
 app = FastAPI(title = "LLM Inference ML Service")   
 
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request_id
+    logging.info(
+        "request_completed",
+        extra={
+            "request_id": request_id,
+            "path": request.url.path
+        }
+    )
+    return response
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    with LATENCY.labels(path=request.url.path).time():
+        response = await call_next(request)
+    REQUESTS.labels(path=request.url.path, method=request.method, status=response.status_code).inc()
+    return response
+
+    
 #request model
 class GenerateRequest(BaseModel):
     prompt:  str
@@ -193,7 +224,7 @@ def generate_async(req: GenerateRequest, x_client_id: str = Header(None)):
     )
 
     run_async_inference.delay(job_id, req.prompt, req.sentences)
-
+    
     return{
         "job_id": job_id,
         "status": "pending"
@@ -232,6 +263,11 @@ def get_result(job_id: str):
         "job_id": job_id,
         "status": status
     }
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type="text/plain")
+
     
 
 

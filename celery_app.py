@@ -1,7 +1,7 @@
 import os
 from celery import Celery
 from dotenv import load_dotenv
-
+from kombu import Queue
 load_dotenv()
 
 REDIS_HOST = os.getenv("REDIS_HOST","redis")
@@ -16,3 +16,16 @@ celery_app = Celery(
     backend=BACKEND_URL,
     include=["tasks"]
 )
+
+celery_app.conf.update(
+    task_soft_time_limit=25,
+    task_time_limit=30,
+    result_expires=3600,
+)
+celery_app.conf.task_queues=(
+    Queue("short"),
+    Queue("long"),
+)
+celery_app.conf.task_routes = {
+    "tasks.run_async_inference": {"queue":"long"},
+}
