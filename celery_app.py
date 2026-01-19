@@ -28,4 +28,5 @@ celery_app.conf.task_queues=(
 )
 celery_app.conf.task_routes = {
     "tasks.run_async_inference": {"queue":"long"},
+    "tasks.run_async_inference_short": {"queue":"short"},
 }

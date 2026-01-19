@@ -9,5 +9,6 @@ httpx
 redis
 celery
 prometheus-client
+python-json-logger
 
 
