@@ -7,15 +7,32 @@ import re
 import hashlib
 import json
 import uuid
-from tasks import run_async_inference
+from tasks import run_async_inference, run_async_inference_short
 import logging
 from services import redis_client, client, clean_output, limit_sentences, HF_MODEL_ID
 from prometheus_client import Counter, Histogram, generate_latest
+from pythonjsonlogger import jsonlogger
 
 
 
 
 load_dotenv()
+
+logger = logging.getLogger("llm_service")
+logger.setLevel(logging.INFO)
+
+log_handler = logging.StreamHandler()
+log_formatter = jsonlogger.JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s %(request_id)s %(job_id)s"
+)
+log_handler.setFormatter(log_formatter)
+
+if not logger.handlers:
+    logger.addHandler(log_handler)
+
+logging.getLogger().handlers = logger.handlers
+logging.getLogger().setLevel(logging.INFO)
+
 
 
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -114,9 +131,10 @@ app = FastAPI(title = "LLM Inference ML Service")
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-Id"] = request_id
-    logging.info(
+    logger.info(
         "request_completed",
         extra={
             "request_id": request_id,
@@ -179,7 +197,7 @@ def generate(req: GenerateRequest, x_client_id: str = Header(None)):
                 {"role":"user","content": req.prompt}
                       ],
             temperature=0.4,
-            max_tokens=100
+            max_tokens=256
         )
 
         raw_output= completion.choices[0].message.content
@@ -223,7 +241,11 @@ def generate_async(req: GenerateRequest, x_client_id: str = Header(None)):
         "pending"
     )
 
-    run_async_inference.delay(job_id, req.prompt, req.sentences)
+    if req.sentences <=2:
+        run_async_inference_short.delay(job_id, req.prompt, req.sentences)
+    else:
+        run_async_inference.delay(job_id, req.prompt, req.sentences)
+        
     
     return{
         "job_id": job_id,

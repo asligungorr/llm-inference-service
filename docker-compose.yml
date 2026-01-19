@@ -32,6 +32,15 @@ services:
       - .env
     depends_on:
       - redis
+  worker-short:
+    build: .
+    container_name: llm-worker-short
+    command: celery -A celery_app.celery_app worker -Q short --loglevel=info
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    
   prometheus:
     image: prom/prometheus:v2.52.0
     container_name: prometheus
