@@ -8,4 +8,6 @@ pytest-asyncio
 httpx
 redis
 celery
+prometheus-client
+
 
